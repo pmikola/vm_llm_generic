@@ -1,4 +1,5 @@
 import os, sys, hashlib, pathlib, contextlib, paramiko, docker
+import subprocess
 import time
 from dotenv import load_dotenv
 from getpass import getpass
@@ -7,7 +8,7 @@ import io
 # ssh-keygen -t ed25519 -C "ovh_llm" -f "$env:USERPROFILE\.ssh\ssh_test"
 load_dotenv()
 # === conf ===========================================================
-HOST        = os.getenv("OVH_HOST", "51.161.82.41")
+HOST        = os.getenv("OVH_HOST", "148.113.137.67")
 USER        = os.getenv("OVH_USER", "ubuntu")
 pkay        = r"C:\Users\Msi\.ssh\ssh_test_rsa"
 KEY_PATH    = os.getenv("OVH_KEY", pkay)
@@ -57,10 +58,51 @@ def wait_apt_unlock(ssh, timeout=600):
         time.sleep(5)
 # gptgen ####################################################
 
+def ensure_ssh_agent_key(key_path: str):
+    try:
+        agent_keys = subprocess.check_output(
+            ["ssh-add", "-l"],
+            stderr=subprocess.DEVNULL
+        ).decode()
+    except subprocess.CalledProcessError:
+        agent_keys = ""
+
+    fp = subprocess.check_output(
+        ["ssh-keygen", "-lf", key_path]
+    ).decode().split()[1]
+
+    if fp not in agent_keys:
+        print(f"Key {key_path} not found in ssh-agent, loading…")
+        subprocess.check_call(["ssh-add", key_path])
+    else:
+        print(f"Key {key_path} already loaded in ssh-agent.")
+
+def ensure_known_host(host: str, known_hosts_path: str = None):
+    if known_hosts_path is None:
+        known_hosts_path = os.path.expanduser("~/.ssh/known_hosts")
+    os.makedirs(os.path.dirname(known_hosts_path), exist_ok=True)
+    try:
+        with open(known_hosts_path, "r", encoding="utf-8") as f:
+            existing = f.read()
+    except FileNotFoundError:
+        existing = ""
+
+    if host not in existing:
+        print(f"Adding {host} to known_hosts")
+        result = subprocess.run(
+            ["ssh-keyscan", "-H", host],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        with open(known_hosts_path, "a", encoding="utf-8") as f:
+            f.write(result.stdout)
+    else:
+        print(f"{host} already in known_hosts; skipping")
 
 def test_ssh_connection():
     print(KEY_PATH)
-    print(f"🔑 Próba połączenia do {USER}@{HOST}…")
+    print(f"Connection.... {USER}@{HOST}…")
     private_key_file = KEY_PATH
     try:
         try:
@@ -86,15 +128,11 @@ def test_ssh_connection():
 
 
 def new_ssh():
-    try:
-        pkey = paramiko.RSAKey.from_private_key_file(KEY_PATH)
-    except paramiko.PasswordRequiredException:
-        pkey = paramiko.RSAKey.from_private_key_file(
-            KEY_PATH, password=getpass(f"Passphrase for {KEY_PATH}: "))
-    ssh = paramiko.SSHClient()
-    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    ssh.connect(HOST, username=USER, pkey=pkey, timeout=15)
-    return ssh
+    key = paramiko.RSAKey.from_private_key_file(KEY_PATH)
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    client.connect(HOST, username=USER, pkey=key, timeout=15)
+    return client
 
 
 def run(ssh, cmd, sudo=False):
@@ -121,18 +159,15 @@ def run(ssh, cmd, sudo=False):
 # gptgen ####################################################
 def ensure_docker(ssh):
     print("🐳  Installing Docker Engine + NVIDIA Container Toolkit…")
-    wait_apt_unlock(ssh)
+    # wait_apt_unlock(ssh)
     run(ssh, "apt-get update", sudo=True)
     run(ssh, "apt-get install -y docker.io", sudo=True)
-
-    run(ssh,
-        "wget -qO /tmp/cuda-keyring.deb "
+    run(ssh,"wget -qO /tmp/cuda-keyring.deb "
         "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/"
         "x86_64/cuda-keyring_1.1-1_all.deb",                       sudo=True)
-    run(ssh, "dpkg -i /tmp/cuda-keyring.deb", sudo=True)           # :contentReference[oaicite:1]{index=1}
+    run(ssh, "dpkg -i /tmp/cuda-keyring.deb", sudo=True)
     run(ssh, "apt-get update", sudo=True)
 
-    # 3) NVIDIA Container Toolkit + konfiguracja runtime
     run(ssh, "apt-get install -y nvidia-container-toolkit", sudo=True)
     run(ssh, "nvidia-ctk runtime configure --runtime=docker", sudo=True)
     run(ssh, "systemctl restart docker", sudo=True)
@@ -155,10 +190,9 @@ def human(n_bytes):
     return f"{n_bytes:.1f} PB"
 
 def upload_if_changed(sftp, local_file: pathlib.Path, remote_file: str):
+    local_size = local_file.stat().st_size
     try:
-        with sftp.open(remote_file, "rb") as r:
-            remote_hash = hashlib.sha256(r.read()).hexdigest()
-        if remote_hash == sha256(local_file) or sftp.stat(remote_file).st_size == local_file.stat().st_size:
+        if sftp.stat(remote_file).st_size == local_size:
             print(f" {local_file.name} up to date.")
             return
         print(f"{local_file.name} reloading...")
@@ -189,8 +223,22 @@ def upload_context(ssh):
 
 # ---------- docker‑ SSH --------------------------------------------
 def docker_cli():
-    host_keys_path = os.path.expanduser("~/.ssh/ssh_test_rsa")
-    pathlib.Path(host_keys_path).touch(exist_ok=True)
+    import paramiko, pathlib, os
+    from paramiko import HostKeys, Transport
+
+    kh = os.path.expanduser("~/.ssh/known_hosts")
+    pathlib.Path(kh).touch(exist_ok=True)
+
+    hk = HostKeys(kh)
+    if HOST not in hk:
+        t = Transport((HOST, 22))
+        t.connect()                         # anonimowe handshake
+        srv_key = t.get_remote_server_key()
+        t.close()
+        hk.add(HOST, srv_key.get_name(), srv_key)
+        hk.save(kh)
+        print(f"🔐  Host key zapisany dla {HOST}")
+    return docker.DockerClient(base_url=f"ssh://{USER}@{HOST}",use_ssh_client=True)
 
 def build_and_run(client):
     print("Building remote image…")
@@ -212,16 +260,40 @@ def build_and_run(client):
         detach=True,
         restart_policy={"Name": "unless-stopped"}
     )
+def run_cmd(ssh, cmd, sudo=False):
+    import shlex
+    if sudo:
+        cmd = "sudo bash -lc " + shlex.quote(cmd)
+    stdin, stdout, stderr = ssh.exec_command(cmd)
+    exit_status = stdout.channel.recv_exit_status()
+    out = stdout.read().decode()
+    err = stderr.read().decode()
+    if exit_status != 0:
+        raise RuntimeError(f"Command failed ({cmd}): {err.strip()}")
+    return out.strip()
+
+def build_and_run_remote(ssh):
+    cmd = (
+        f"cd {REMOTE_DIR} && "
+        f"docker build -t {IMAGE_TAG} . && "
+        f"docker rm -f {CONTAINER} || true && "
+        f"docker run -d --gpus all --restart unless-stopped "
+        f"-p {PORT}:{PORT} --name {CONTAINER} {IMAGE_TAG}"
+    )
+    print("Building and running container on remote host…")
+    print(run_cmd(ssh, cmd, sudo=True))
 # ---------- main -------------------------------------------------------------
 if __name__ == "__main__":
     test_ssh_connection()
+    ensure_known_host(HOST)
     ssh = new_ssh()
     try:
         ensure_docker(ssh)
         upload_context(ssh)
+        build_and_run_remote(ssh)
     finally:
         ssh.close()
     # TODO : problem with build and run (cli)
     # TODO : problem with build context in llm folder on the cloud side (freezing - uploading anyway the model without progress bar?)
-    build_and_run(docker_cli())
+    #build_and_run(docker_cli())
     print(f"\n LLM API ready:  http://{HOST}:{PORT}/v1/chat/completions\n")
