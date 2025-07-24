@@ -194,7 +194,7 @@ def ensure_docker_with_nvidia(ssh):
     bsh("apt-get install -y nvidia-container-toolkit nvidia-container-toolkit-base libnvidia-container-tools libnvidia-container1")
     bsh("nvidia-ctk runtime configure --runtime=docker")
 
-    # 4) Note restart & permissions
+    # Note restart & permissions
     bsh("systemctl restart docker")
     bsh(f"usermod -aG docker {USER}")
     print("\nDocker + NVIDIA runtime ready")
