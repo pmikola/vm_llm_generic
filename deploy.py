@@ -240,7 +240,7 @@ def upload_ctx(ssh):
 
     done = 0
     last_bar = -1
-
+    # gptgen ########
     def draw_bar():
         nonlocal last_bar
         pct = int(done * 100 / grand_total)
