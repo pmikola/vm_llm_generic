@@ -53,7 +53,6 @@ def _load_model_once():
             MODEL_DIR, trust_remote_code=True, local_files_only=True
         )
 
-        # pick a dtype
         dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
 
         mdl = AutoModelForCausalLM.from_pretrained(
