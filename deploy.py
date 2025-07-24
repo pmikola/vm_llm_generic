@@ -546,6 +546,8 @@ def build_and_run(ssh) -> None:
         f"-e MODEL_DIR={CONTAINER_MODEL_DIR} "
         f"--restart unless-stopped {IMAGE_TAG}"
     )
+
+    # gptgen ######
     discovered = discover_model_dir(ssh, CONTAINER)
     if not discovered:
         print("\n>>> Diagnostics (couldn’t find model automatically)")
@@ -554,30 +556,31 @@ def build_and_run(ssh) -> None:
         logs = run(ssh, f"sudo -n docker logs --tail 200 {CONTAINER} || true")
         print("\n--- last 200 container log lines ---\n", logs)
         raise RuntimeError("No directory containing a full HF model was found inside the container.")
-
+    # gptgen ######
     print(f"\n✅  Model directory discovered: {discovered}")
-
+    # gptgen ######
     if discovered != CONTAINER_MODEL_DIR:
         print(
             "⚠️  NOTE: The container was started with MODEL_DIR=/model,\n"
             f"    but the files are under {discovered}.\n"
             "    You may want to adjust the -v mount or set MODEL_DIR accordingly."
         )
-
+    # gptgen ######
     print("\n### Contents of the discovered model directory")
     list_dir_tree(ssh, CONTAINER, discovered, depth=2)
 
     open_port(ssh, PORT)
-
+    # gptgen ######
     print("\n>> Waiting for health-check …")
     if not wait_for_docker_health(ssh, CONTAINER, timeout_s=600, interval_s=2):
         if not check_container_health(ssh, PORT, CONTAINER, path="/health"):
             logs = run(ssh, f"sudo -n docker logs --tail 200 {CONTAINER} || true")
             print("\n--- last 200 container log lines ---\n", logs)
             raise RuntimeError(" Container did not pass health check.")
+    # gptgen ######
+    print("Health check OK – the service should be live!")
 
-    print("🎉  Health check OK – the service should be live!")
-
+# gptgen ######
 def debug_health(ssh):
     print("\n### docker ps")
     print(run(ssh, "sudo -n docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'"))
