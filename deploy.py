@@ -453,6 +453,7 @@ def wait_for_docker_health(ssh, container, timeout_s=600, interval_s=2):
         time.sleep(interval_s)
     return False
 
+# gptgen ######
 def _shell_quote(s: str) -> str:
     return "'" + s.replace("'", r"'\''") + "'"
 
