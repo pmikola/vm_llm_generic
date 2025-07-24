@@ -1,299 +1,609 @@
-import os, sys, hashlib, pathlib, contextlib, paramiko, docker
-import subprocess
-import time
+#!/usr/bin/env python3
+"""deploy.py — push local llm/ context to an OVH VM, build & run the GPU container."""
+
+import os, sys, time, tarfile, io, contextlib, pathlib
+import paramiko, docker
 from dotenv import load_dotenv
-from getpass import getpass
-import io
+import os, posixpath
+from math import log2
 
-# ssh-keygen -t ed25519 -C "ovh_llm" -f "$env:USERPROFILE\.ssh\ssh_test"
 load_dotenv()
-# === conf ===========================================================
-HOST        = os.getenv("OVH_HOST", "148.113.137.67")
-USER        = os.getenv("OVH_USER", "ubuntu")
-pkay        = r"C:\Users\Msi\.ssh\ssh_test_rsa"
-KEY_PATH    = os.getenv("OVH_KEY", pkay)
-LOCAL_CTX   = pathlib.Path("llm")
-REMOTE_DIR  = f"/home/{USER}/llm"
-IMAGE_TAG   = "llm:latest"
-CONTAINER   = "llm"
-MODEL_FILE  = "model.safetensors"
-PORT        = 8000
-TIMEOUT  = 5
-# ============================================================================
-with open(pkay, "r", encoding="utf-8") as f:
-    for line in f:
-        print(line, end="")
 
-# === progress vis ===========================================================
-# gptgen ####################################################
-def make_progress_bar(total_bytes: int, width: int = 40):
-    total = max(total_bytes, 1)
-    last_pct_drawn = -1
-    def _cb(transferred: int, _):
-        nonlocal last_pct_drawn
-        pct = int(transferred * 100 / total)
-        if pct != last_pct_drawn:
-            last_pct_drawn = pct
-            filled = int(width * pct / 100)
-            bar = "█" * filled + "─" * (width - filled)
-            sys.stdout.write(
-                f"\r   ⬆️  [{bar}] {pct:3d}% "
-                f"({transferred/1_048_576:,.1f}/{total/1_048_576:.1f} MB)"
-            )
-            sys.stdout.flush()
-        if transferred >= total:
-            sys.stdout.write("\n")
-    return _cb
+# ───────── config ────────────────────────────────────────────────────────────
+HOST      = os.getenv("OVH_HOST", "51.79.31.174")
+USER      = os.getenv("OVH_USER", "ubuntu")
+KEY       = os.getenv("OVH_KEY",  r"C:\Users\Msi\.ssh\ssh_test_rsa")
+LOCAL_CTX = pathlib.Path("llm")
+REMOTE    = f"/home/{USER}/llm"
+HOST_MODEL_DIR     = f"{REMOTE}/model"
+CONTAINER_MODEL_DIR = "/workspace/model"
+IMAGE_TAG = "llm:latest"
+CONTAINER = "llm"
+PORT      = 8000
+RETRIES_PER_FILE = 5
+CHUNK_SIZE = 4 * 1024 * 1024
+SHOW_MODE = "sum"   #Note: or "max"
+# ───────── config ────────────────────────────────────────────────────────────
 
-def wait_apt_unlock(ssh, timeout=600):
-    import time
-    t0 = time.time()
-    while True:
-        lock = run(ssh, "ls /var/lib/dpkg/lock-frontend || true")
-        if not lock:
-            return
-        if time.time() - t0 > timeout:
-            raise TimeoutError("apt lock not released in time")
-        print("⌛  unattended-upgrades w toku… czekam 5 s")
-        time.sleep(5)
-# gptgen ####################################################
+def human_mb(b):
+    return f"{b/1_048_576:,.1f} MB"
 
-def ensure_ssh_agent_key(key_path: str):
+def open_ssh() -> paramiko.SSHClient:
+    ssh = paramiko.SSHClient()
+    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    ssh.connect(HOST, username=USER,
+                pkey=paramiko.RSAKey.from_private_key_file(KEY), timeout=15)
+    ssh.get_transport().set_keepalive(30)
+    return ssh
+
+# gptgen ##############
+def safe_put_file(ssh, local_path: pathlib.Path, remote_path: str,
+                  show_progress: bool, total_for_bar: int | None,
+                  bump=None):
+    size = local_path.stat().st_size
+    attempt = 0
+    sent = 0
+
+    def open_sftp():
+        return ssh.open_sftp()
+
+    sftp = open_sftp()
+
     try:
-        agent_keys = subprocess.check_output(
-            ["ssh-add", "-l"],
-            stderr=subprocess.DEVNULL
-        ).decode()
-    except subprocess.CalledProcessError:
-        agent_keys = ""
-
-    fp = subprocess.check_output(
-        ["ssh-keygen", "-lf", key_path]
-    ).decode().split()[1]
-
-    if fp not in agent_keys:
-        print(f"Key {key_path} not found in ssh-agent, loading…")
-        subprocess.check_call(["ssh-add", key_path])
-    else:
-        print(f"Key {key_path} already loaded in ssh-agent.")
-
-def ensure_known_host(host: str, known_hosts_path: str = None):
-    if known_hosts_path is None:
-        known_hosts_path = os.path.expanduser("~/.ssh/known_hosts")
-    os.makedirs(os.path.dirname(known_hosts_path), exist_ok=True)
-    try:
-        with open(known_hosts_path, "r", encoding="utf-8") as f:
-            existing = f.read()
+        st = sftp.stat(remote_path)
+        sent = st.st_size
     except FileNotFoundError:
-        existing = ""
+        sent = 0
 
-    if host not in existing:
-        print(f"Adding {host} to known_hosts")
-        result = subprocess.run(
-            ["ssh-keyscan", "-H", host],
-            capture_output=True,
-            text=True,
-            check=True
-        )
-        with open(known_hosts_path, "a", encoding="utf-8") as f:
-            f.write(result.stdout)
-    else:
-        print(f"{host} already in known_hosts; skipping")
+    while sent < size:
+        attempt += 1
+        if attempt > RETRIES_PER_FILE:
+            raise RuntimeError(f"Giving up after {RETRIES_PER_FILE} retries uploading {local_path}")
 
-def test_ssh_connection():
-    print(KEY_PATH)
-    print(f"Connection.... {USER}@{HOST}…")
-    private_key_file = KEY_PATH
-    try:
         try:
-            pkey = paramiko.RSAKey.from_private_key_file(private_key_file)
-        except paramiko.PasswordRequiredException:
-            pw = getpass(f"Passphrase for {KEY_PATH}: ")
-            pkey = paramiko.RSAKey.from_private_key_file(private_key_file, password=pw)
-        client = paramiko.SSHClient()
-        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        client.connect(HOST, username=USER, pkey=pkey, timeout=TIMEOUT)
-    except paramiko.AuthenticationException as auth_err:
-        print("auth error:", auth_err)
-    except paramiko.SSHException as ssh_err:
-        print("SSHException:", ssh_err)
-    except Exception as e:
-        print("Connection failed:", e)
-    else:
-        print("✅ Connection Established!")
-        stdin, stdout, stderr = client.exec_command("uname -a")
-        print("Test command result:", stdout.read().decode().strip())
-        client.close()
-# gptgen ####################################################
+            parent = posixpath.dirname(remote_path)
+            try:
+                sftp.stat(parent)
+            except FileNotFoundError:
+                run(ssh, f"sudo -n mkdir -p {parent} && sudo -n chown -R {USER}:{USER} {parent}", stream=True)
+                sftp = open_sftp()
 
+            with local_path.open("rb") as lf:
+                lf.seek(sent)
+                with sftp.file(remote_path, "ab") as rf:
+                    rf.set_pipelined(True)
+                    while sent < size:
+                        chunk = lf.read(CHUNK_SIZE)
+                        if not chunk:
+                            break
+                        rf.write(chunk)
+                        sent += len(chunk)
+                        if bump:
+                            bump(len(chunk))
+                        if show_progress:
+                            pct = int(sent * 100 / size)
+                            bar = "█" * (pct // 2) + "─" * (50 - pct // 2)
+                            sys.stdout.write(
+                                f"\r→ {local_path.name} [{bar}] {pct:3d}% ({fmt_bytes(sent)}/{fmt_bytes(size)})"
+                            )
+                            sys.stdout.flush()
+            break
+        except (EOFError, OSError, socket.error, paramiko.SSHException) as e:
+            try:
+                sftp.close()
+            except Exception:
+                pass
+            try:
+                ssh.close()
+            except Exception:
+                pass
+            ssh = open_ssh()
+            sftp = open_sftp()
+            try:
+                sent = sftp.stat(remote_path).st_size
+            except FileNotFoundError:
+                sent = 0
+            print(f"\n[retry {attempt}/{RETRIES_PER_FILE}] resuming {local_path.name} @ {fmt_bytes(sent)} due to: {e}")
 
-def new_ssh():
-    key = paramiko.RSAKey.from_private_key_file(KEY_PATH)
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    client.connect(HOST, username=USER, pkey=key, timeout=15)
-    return client
+    if show_progress:
+        sys.stdout.write("\n")
+        sys.stdout.flush()
 
-
-def run(ssh, cmd, sudo=False):
-    if sudo and not cmd.startswith("sudo"):
-        cmd = "sudo " + cmd
+def run(ssh, cmd, *, sudo=False, stream=False, timeout=None):
+    if sudo and not cmd.lstrip().startswith("sudo"):
+        cmd = "sudo -n " + cmd
     chan = ssh.get_transport().open_session()
+    chan.settimeout(timeout)
+    chan.get_pty()
     chan.exec_command(cmd)
-    stdout = []
-    while not chan.exit_status_ready():
+    stdout_chunks = []
+    stderr_chunks = []
+    def drain():
         while chan.recv_ready():
-            data = chan.recv(1024).decode()
-            sys.stdout.write(data)
-            stdout.append(data)
+            data = chan.recv(4096).decode(errors="replace")
+            stdout_chunks.append(data)
+            if stream:
+                sys.stdout.write(data)
+                sys.stdout.flush()
         while chan.recv_stderr_ready():
-            sys.stderr.write(chan.recv_stderr(1024).decode())
-        time.sleep(0.2)
-    stdout.append(chan.recv(4096).decode())
-    stderr = chan.recv_stderr(4096).decode()
+            data = chan.recv_stderr(4096).decode(errors="replace")
+            stderr_chunks.append(data)
+            if stream:
+                sys.stderr.write(data)
+                sys.stderr.flush()
+    while not chan.exit_status_ready():
+        drain()
+        time.sleep(0.05)
+    drain()
     exit_code = chan.recv_exit_status()
+    out = "".join(stdout_chunks)
+    err = "".join(stderr_chunks)
+
     if exit_code != 0:
-        raise RuntimeError(stderr)
-    return "".join(stdout).strip()
+        raise RuntimeError(
+            f"Command failed (exit {exit_code}): {cmd}\n\n"
+            f"--- STDOUT ---\n{out}\n"
+            f"--- STDERR ---\n{err}"
+        )
+    return out
 
-# gptgen ####################################################
-def ensure_docker(ssh):
-    print("🐳  Installing Docker Engine + NVIDIA Container Toolkit…")
-    # wait_apt_unlock(ssh)
-    run(ssh, "apt-get update", sudo=True)
-    run(ssh, "apt-get install -y docker.io", sudo=True)
-    run(ssh,"wget -qO /tmp/cuda-keyring.deb "
-        "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/"
-        "x86_64/cuda-keyring_1.1-1_all.deb",                       sudo=True)
-    run(ssh, "dpkg -i /tmp/cuda-keyring.deb", sudo=True)
-    run(ssh, "apt-get update", sudo=True)
 
-    run(ssh, "apt-get install -y nvidia-container-toolkit", sudo=True)
-    run(ssh, "nvidia-ctk runtime configure --runtime=docker", sudo=True)
-    run(ssh, "systemctl restart docker", sudo=True)
-    run(ssh, f"usermod -aG docker {USER}", sudo=True)
-# gptgen ####################################################
+def ensure_docker_with_nvidia(ssh):
+    bsh = lambda c: run(ssh, f"bash -c \"{c}\"", sudo=True,stream=True)
+    # Note: Clear
+    bsh("rm -f /etc/apt/sources.list.d/*docker*.list* /etc/apt/keyrings/docker.asc /etc/apt/keyrings/docker.gpg")
 
-# ---------- upload build‑context ---------------------------------------------
-def sha256(path: pathlib.Path, buf=65536):
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        while chunk := f.read(buf):
-            h.update(chunk)
-    return h.hexdigest()
+    # Note: Docker
+    bsh("apt-get upgrade -y")
+    bsh("apt-get update -y")
+    bsh("apt-get install -y --no-install-recommends ca-certificates curl gnupg lsb-release")
+    bsh("apt-get install curl")
+    bsh("install -m 0755 -d /etc/apt/keyrings")
+    bsh("curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc")
+    bsh("chmod 0644 /etc/apt/keyrings/docker.asc")
+        #bsh("chmod a+r /etc/apt/keyrings/docker.asc")
+    bsh("echo \"deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] "
+        "https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo ${UBUNTU_CODENAME:-$VERSION_CODENAME}) stable\" "
+        ">> /etc/apt/sources.list.d/docker.list")
+    bsh("apt-get update -y")
+    bsh("apt install -y apt-transport-https ca-certificates curl software-properties-common")
+    bsh("curl -fsSL https://download.docker.com/linux/ubuntu/gpg")
+    bsh(r'''
+        wget -qO - https://package.perforce.com/perforce.pubkey \
+          | gpg --batch --yes --dearmor -o /usr/share/keyrings/perforce-archive-keyring.gpg
+        ''')
+    bsh(r'''
+        echo "deb [signed-by=/usr/share/keyrings/perforce-archive-keyring.gpg] \
+        http://package.perforce.com/apt/ubuntu focal release" \
+          | tee /etc/apt/sources.list.d/perforce.list > /dev/null
+        ''')
+    bsh("apt-get update -y")
+    bsh("apt-get install -y docker.io")
+    bsh("systemctl enable docker")
+    bsh("systemctl start docker")
+    bsh("sleep 2")
+    bsh("docker --version")
+    bsh("docker run --rm hello-world")
 
-def human(n_bytes):
-    for unit in ["B", "KB", "MB", "GB", "TB"]:
-        if n_bytes < 1024:
-            return f"{n_bytes:.1f} {unit}"
-        n_bytes /= 1024
-    return f"{n_bytes:.1f} PB"
+#     # Note: NVIDIA Container Toolkit
+    bsh("curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | gpg --batch --yes --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg")
+    bsh("curl -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | "
+        "sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' "
+        "| tee /etc/apt/sources.list.d/nvidia-container-toolkit.list > /dev/null")
+    bsh("apt-get update -y")
+    bsh("apt-get install -y nvidia-container-toolkit nvidia-container-toolkit-base libnvidia-container-tools libnvidia-container1")
+    bsh("nvidia-ctk runtime configure --runtime=docker")
 
-def upload_if_changed(sftp, local_file: pathlib.Path, remote_file: str):
-    local_size = local_file.stat().st_size
-    try:
-        if sftp.stat(remote_file).st_size == local_size:
-            print(f" {local_file.name} up to date.")
-            return
-        print(f"{local_file.name} reloading...")
-    except FileNotFoundError:
-        print(f"{local_file.name} model not exist -> sending...")
+    # 4) Note restart & permissions
+    bsh("systemctl restart docker")
+    bsh(f"usermod -aG docker {USER}")
+    print("\nDocker + NVIDIA runtime ready")
 
-    filesize = local_file.stat().st_size
-    with local_file.open("rb") as lf:
-        sftp.putfo(lf, remote_file, callback=make_progress_bar(filesize))
-    print("Done.")
 
-def upload_context(ssh):
-    print(f"Upload build‑context → {REMOTE_DIR}")
+def fmt_bytes(b):
+    units = ["B", "KB", "MB", "GB", "TB"]
+    if b == 0:
+        return "0 B"
+    i = min(int(log2(b) / 10), len(units) - 1)
+    return f"{b / (1024 ** i):,.1f} {units[i]}"
+
+def ensure_remote_dir_writable(ssh, path: str, user: str):
+    run(ssh, f"sudo -n mkdir -p {path}", stream=True)
+    run(ssh, f"sudo -n chown -R {user}:{user} {path}", stream=True)
+
+def upload_ctx(ssh):
+    # TODO: Need to send models via https not sftp
+    print(">> Uploading context (SFTP)")
+    ensure_remote_dir_writable(ssh, REMOTE, USER)
+    ensure_remote_dir_writable(ssh, f"{REMOTE}/model", USER)
     sftp = ssh.open_sftp()
-    with contextlib.suppress(IOError):
-        sftp.mkdir(REMOTE_DIR)
 
-    upload_if_changed(
-        sftp,
-        LOCAL_CTX / MODEL_FILE,
-        f"{REMOTE_DIR}/{MODEL_FILE}"
-    )
-    for item in LOCAL_CTX.iterdir():
-        if item.name == MODEL_FILE:
-            continue
-        sftp.put(str(item), f"{REMOTE_DIR}/{item.name}")
+    with contextlib.suppress(OSError):
+        sftp.mkdir(REMOTE)
+
+    files = [p for p in LOCAL_CTX.rglob("*") if p.is_file()]
+    manifest = [(p, p.stat().st_size) for p in files]
+    total_bytes   = sum(sz for _, sz in manifest)
+    largest_bytes = max((sz for _, sz in manifest), default=0)
+
+    print("Files to sync:")
+    for p, sz in sorted(manifest, key=lambda x: x[1], reverse=True):
+        rel = str(p.relative_to(LOCAL_CTX))
+        print(f"  {rel:<40} {fmt_bytes(sz)}")
+    print()
+
+    grand_total = total_bytes if SHOW_MODE == "sum" else largest_bytes
+    if grand_total == 0:
+        print("Nothing to upload.")
+        sftp.close()
+        return
+
+    done = 0
+    last_bar = -1
+
+    def draw_bar():
+        nonlocal last_bar
+        pct = int(done * 100 / grand_total)
+        if pct == last_bar:
+            return
+        last_bar = pct
+        bar = "█" * (pct // 2) + "─" * (50 - pct // 2)
+        sys.stdout.write(
+            f"\r⬆️  [{bar}] {pct:3d}% ({fmt_bytes(done)}/{fmt_bytes(grand_total)})"
+        )
+        sys.stdout.flush()
+        if done >= grand_total:
+            sys.stdout.write("\n")
+
+    def bump(delta):
+        nonlocal done
+        done += delta
+        if done > grand_total:
+            done = grand_total
+        draw_bar()
+
+    def ensure_dirs(path):
+        parts = path.split("/")
+        cur = ""
+        for part in parts:
+            if not part:
+                continue
+            cur = cur + "/" + part
+            with contextlib.suppress(OSError):
+                sftp.mkdir(cur)
+
+    for p, size in manifest:
+        rel_str = p.relative_to(LOCAL_CTX).as_posix()
+        remote = posixpath.join(REMOTE, rel_str)
+
+        try:
+            if sftp.stat(remote).st_size == size:
+                print(f"  {rel_str} (skip, {fmt_bytes(size)})")
+                if SHOW_MODE == "sum":
+                    bump(size)
+                continue
+        except FileNotFoundError:
+            pass
+
+        print(f"\n→ {rel_str} ({fmt_bytes(size)})")
+
+        if size > 64 * 1024 * 1024:
+            safe_put_file(ssh, p, remote, show_progress=True,
+                          total_for_bar=grand_total, bump=bump if SHOW_MODE == "sum" else None)
+        else:
+            tries = 0
+            while True:
+                tries += 1
+                try:
+                    last = 0
+
+                    def cb(tx, total):
+                        nonlocal last
+                        delta = tx - last
+                        last = tx
+                        if SHOW_MODE == "sum":
+                            bump(delta)
+                        elif size == largest_bytes:
+                            bump(delta)
+
+                    sftp.put(str(p), remote, callback=cb, confirm=False)
+                    break
+                except (EOFError, OSError, socket.error, paramiko.SSHException) as e:
+                    if tries >= RETRIES_PER_FILE:
+                        raise
+                    print(f"\n[retry {tries}/{RETRIES_PER_FILE}] {rel_str} due to: {e}")
+                    try:
+                        sftp.close()
+                    except Exception:
+                        pass
+                    ssh = open_ssh()
+                    sftp = ssh.open_sftp()
+
     sftp.close()
+    if SHOW_MODE == "sum" and done < grand_total:
+        bump(grand_total - done)
+    print("\n✓ Upload complete")
 
-# ---------- docker‑ SSH --------------------------------------------
-def docker_cli():
-    import paramiko, pathlib, os
-    from paramiko import HostKeys, Transport
+def tar_context(folder):
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tar:
+        for p in folder.rglob("*"):
+            tar.add(p, arcname=p.relative_to(folder))
+    buf.seek(0)
+    return buf
 
-    kh = os.path.expanduser("~/.ssh/known_hosts")
-    pathlib.Path(kh).touch(exist_ok=True)
+# gptgen ######
+def render_build_line(line, layers):
+    if 'stream' in line:
+        sys.stdout.write(line['stream'])
+        sys.stdout.flush()
+        return
 
-    hk = HostKeys(kh)
-    if HOST not in hk:
-        t = Transport((HOST, 22))
-        t.connect()                         # anonimowe handshake
-        srv_key = t.get_remote_server_key()
-        t.close()
-        hk.add(HOST, srv_key.get_name(), srv_key)
-        hk.save(kh)
-        print(f"🔐  Host key zapisany dla {HOST}")
-    return docker.DockerClient(base_url=f"ssh://{USER}@{HOST}",use_ssh_client=True)
+    if 'status' in line and 'id' in line:
+        _id = line['id']
+        status = line['status']
+        detail = line.get('progressDetail') or {}
+        cur, tot = detail.get('current'), detail.get('total')
 
-def build_and_run(client):
-    print("Building remote image…")
-    img, logs = client.images.build(
-        path=REMOTE_DIR, tag=IMAGE_TAG, platform="linux/amd64", quiet=False)
-    for chunk in logs:
-        if "stream" in chunk:
-            sys.stdout.write(chunk["stream"])
+        if tot and tot > 0:
+            pct = int(cur * 100 / tot)
+            layers[_id] = f"{status} {pct:3d}% ({cur/1e6:.1f}/{tot/1e6:.1f} MB)"
+        else:
+            layers[_id] = status
 
-    print("Restarting container…")
-    with contextlib.suppress(docker.errors.NotFound):
-        client.containers.get(CONTAINER).remove(force=True)
+        sys.stdout.write("\r")
+        for k, v in list(layers.items())[-6:]:
+            sys.stdout.write(f"{k[:12]}: {v} | ")
+        sys.stdout.flush()
+        return
 
-    client.containers.run(
-        IMAGE_TAG,
-        name=CONTAINER,
-        ports={f"{PORT}/tcp": PORT},
-        device_requests=[docker.types.DeviceRequest(count=-1, capabilities=[["gpu"]])],
-        detach=True,
-        restart_policy={"Name": "unless-stopped"}
-    )
-def run_cmd(ssh, cmd, sudo=False):
-    import shlex
-    if sudo:
-        cmd = "sudo bash -lc " + shlex.quote(cmd)
-    stdin, stdout, stderr = ssh.exec_command(cmd)
-    exit_status = stdout.channel.recv_exit_status()
-    out = stdout.read().decode()
-    err = stderr.read().decode()
-    if exit_status != 0:
-        raise RuntimeError(f"Command failed ({cmd}): {err.strip()}")
-    return out.strip()
+    if 'aux' in line and isinstance(line['aux'], dict) and 'ID' in line['aux']:
+        sys.stdout.write(f"\nBuilt image: {line['aux']['ID']}\n")
+        sys.stdout.flush()
+        return
 
-def build_and_run_remote(ssh):
-    cmd = (
-        f"cd {REMOTE_DIR} && "
-        f"docker build -t {IMAGE_TAG} . && "
-        f"docker rm -f {CONTAINER} || true && "
-        f"docker run -d --gpus all --restart unless-stopped "
-        f"-p {PORT}:{PORT} --name {CONTAINER} {IMAGE_TAG}"
-    )
-    print("Building and running container on remote host…")
-    print(run_cmd(ssh, cmd, sudo=True))
-# ---------- main -------------------------------------------------------------
-if __name__ == "__main__":
-    test_ssh_connection()
-    ensure_known_host(HOST)
-    ssh = new_ssh()
+    if 'error' in line:
+        raise RuntimeError(line.get('errorDetail', {}).get('message', line['error']))
+
+import socket
+def reboot_and_wait(ssh, host, port=22, timeout=600, poll_every=3):
     try:
-        ensure_docker(ssh)
-        upload_context(ssh)
-        build_and_run_remote(ssh)
-    finally:
+        run(ssh, "sudo -n reboot || sudo reboot", stream=True)
+    except Exception:
+        pass
+    try:
         ssh.close()
-    # TODO : problem with build and run (cli)
-    # TODO : problem with build context in llm folder on the cloud side (freezing - uploading anyway the model without progress bar?)
-    #build_and_run(docker_cli())
-    print(f"\n LLM API ready:  http://{HOST}:{PORT}/v1/chat/completions\n")
+    except Exception:
+        pass
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            sock = socket.create_connection((host, port), timeout=3)
+            sock.close()
+            new = open_ssh()
+            time.sleep(3)
+            return new
+        except Exception:
+            time.sleep(poll_every)
+    raise TimeoutError("VM did not come back after reboot")
+
+def ensure_nvidia_driver(ssh):
+    try:
+        run(ssh, "nvidia-smi -L", sudo=True, timeout=10)
+        print("NVIDIA driver already present.")
+        return ssh
+    except Exception:
+        print("No working NVIDIA driver found. Installing… (will reboot once)")
+        bsh = lambda c: run(ssh, f"bash -lc \"{c}\"", sudo=True, stream=True)
+        bsh("apt-get update -y && apt-get install -y ubuntu-drivers-common linux-headers-$(uname -r)")
+        bsh("ubuntu-drivers autoinstall || true")
+        ssh = reboot_and_wait(ssh, HOST)
+        run(ssh, "nvidia-smi", sudo=True, stream=True)
+        return ssh
+
+# gptgen ######
+def gpu_sanity_check(ssh):
+    bsh = lambda c: run(ssh, f"sudo -n bash -lc \"{c}\"", stream=True)
+    print("Sanity check: docker can see the GPU…")
+    bsh("docker run --rm --gpus all nvidia/cuda:12.6.2-runtime-ubuntu22.04 nvidia-smi")
+
+def open_port(ssh, port):
+    try:
+        run(ssh, f"which ufw >/dev/null 2>&1 && sudo -n ufw allow {port}/tcp || true", stream=True)
+        run(ssh, "which ufw >/dev/null 2>&1 && sudo -n ufw reload || true", stream=True)
+    except Exception:
+        pass
+
+# gptgen ######
+def check_container_health(ssh, port, container, path="/health", tries=120, sleep_s=2):
+    for i in range(tries):
+        code = run(
+            ssh,
+            f"curl -s -o /dev/null -w '%{{http_code}}' http://127.0.0.1:{port}{path}",
+            sudo=True
+        ).strip()
+        if code == "200":
+            print("Health check OK")
+            return True
+        time.sleep(sleep_s)
+
+    logs = run(ssh, f"sudo -n docker logs --tail 200 {container} || true", stream=False)
+    print("\n--- last 200 container log lines ---\n", logs)
+    return False
+
+# gptgen ######
+def wait_for_docker_health(ssh, container, timeout_s=600, interval_s=2):
+    import time
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        try:
+            status = run(
+                ssh,
+                f"sudo -n docker inspect -f '{{{{.State.Health.Status}}}}' {container}",
+                stream=False
+            ).strip()
+            if status == "healthy":
+                print("Docker healthcheck: healthy")
+                return True
+            else:
+                print("Docker healthcheck:", status)
+        except Exception as e:
+            print("Error reading docker health status:", e)
+        time.sleep(interval_s)
+    return False
+
+def _shell_quote(s: str) -> str:
+    return "'" + s.replace("'", r"'\''") + "'"
+
+# gptgen ######
+def discover_model_dir(ssh, container: str) -> str | None:
+    required = [
+        "config.json",
+        "model.safetensors",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "special_tokens_map.json",
+    ]
+    # Note: From HuggingFace Example TinyLama1.1B
+
+    def has_all_files(path: str) -> bool:
+        for f in required:
+            try:
+                run(ssh, f"sudo -n docker exec {container} test -f {path}/{f}", stream=False)
+            except Exception:
+                return False
+        return True
+
+    candidates = [
+        "/model",
+        "/workspace/model",
+        "/workspace",
+        "/data/model",
+        "/data",
+    ]
+    for c in candidates:
+        if has_all_files(c):
+            return c
+
+    try:
+        find_cmd = (
+            "find / -maxdepth 5 -type d \\( -name model -o -name '*llama*' -o -name '*tiny*' -o -name '*hf*' \\) "
+            "2>/dev/null | head -n 100"
+        )
+        out = run(
+            ssh,
+            f"sudo -n docker exec {container} bash -lc { _shell_quote(find_cmd) }",
+            stream=False
+        ).strip()
+        for line in out.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            if has_all_files(line):
+                return line
+    except Exception as e:
+        print("discover_model_dir: find failed:", e)
+
+    return None
+
+def list_dir_tree(ssh, container: str, root: str, depth: int = 2, max_lines: int = 300) -> None:
+    root_q = _shell_quote(root)
+    cmd = (
+        f"sudo -n docker exec {container} bash -lc "
+        f"\"set -e; "
+        f"if [ -d {root_q} ]; then "
+        f"  find {root_q} -maxdepth {depth} -printf '%y %p\\n' 2>/dev/null | head -n {max_lines}; "
+        f"else "
+        f"  echo 'Path {root} does not exist'; "
+        f"fi\""
+    )
+    try:
+        out = run(ssh, cmd, stream=False)
+        print(out.strip())
+    except Exception as e:
+        print(f"(list_dir_tree) failed for {root}: {e}")
+
+def build_and_run(ssh) -> None:
+    print("\n### docker inspect .Mounts")
+    print(run(ssh, f"sudo -n docker inspect -f '{{{{json .Mounts}}}}' {CONTAINER}", stream=False))
+
+    print("\n### host dir listing")
+    print(run(ssh, f"sudo -n bash -lc 'ls -lah {HOST_MODEL_DIR}'", stream=False))
+
+    print("\n### container dir listing (mounted path)")
+    print(run(ssh, f"sudo -n docker exec {CONTAINER} bash -lc 'ls -lah {CONTAINER_MODEL_DIR}'", stream=False))
+    print(">> Building & running (on the VM, no second upload)")
+    bsh = lambda c: run(ssh, f"sudo -n bash -lc \"{c}\"", stream=True)
+
+    bsh(f"cd {REMOTE} && DOCKER_BUILDKIT=1 docker build --progress=plain -t {IMAGE_TAG} .")
+    bsh(f"docker rm -f {CONTAINER} >/dev/null 2>&1 || true")
+    bsh(
+        f"docker run -d --name {CONTAINER} "
+        f"--gpus all -p {PORT}:{PORT} "
+        f"-v {HOST_MODEL_DIR}:{CONTAINER_MODEL_DIR}:ro "
+        f"-e MODEL_DIR={CONTAINER_MODEL_DIR} "
+        f"--restart unless-stopped {IMAGE_TAG}"
+    )
+    discovered = discover_model_dir(ssh, CONTAINER)
+    if not discovered:
+        print("\n>>> Diagnostics (couldn’t find model automatically)")
+        list_dir_tree(ssh, CONTAINER, "/model", depth=3)
+        list_dir_tree(ssh, CONTAINER, "/workspace", depth=3)
+        logs = run(ssh, f"sudo -n docker logs --tail 200 {CONTAINER} || true")
+        print("\n--- last 200 container log lines ---\n", logs)
+        raise RuntimeError("No directory containing a full HF model was found inside the container.")
+
+    print(f"\n✅  Model directory discovered: {discovered}")
+
+    if discovered != CONTAINER_MODEL_DIR:
+        print(
+            "⚠️  NOTE: The container was started with MODEL_DIR=/model,\n"
+            f"    but the files are under {discovered}.\n"
+            "    You may want to adjust the -v mount or set MODEL_DIR accordingly."
+        )
+
+    print("\n### Contents of the discovered model directory")
+    list_dir_tree(ssh, CONTAINER, discovered, depth=2)
+
+    open_port(ssh, PORT)
+
+    print("\n>> Waiting for health-check …")
+    if not wait_for_docker_health(ssh, CONTAINER, timeout_s=600, interval_s=2):
+        if not check_container_health(ssh, PORT, CONTAINER, path="/health"):
+            logs = run(ssh, f"sudo -n docker logs --tail 200 {CONTAINER} || true")
+            print("\n--- last 200 container log lines ---\n", logs)
+            raise RuntimeError(" Container did not pass health check.")
+
+    print("🎉  Health check OK – the service should be live!")
+
+def debug_health(ssh):
+    print("\n### docker ps")
+    print(run(ssh, "sudo -n docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'"))
+
+    print("\n### docker inspect health")
+    print(run(ssh, f"sudo -n docker inspect --format='{{{{json .State.Health}}}}' {CONTAINER} || true"))
+
+    print("\n### /health from inside the container")
+    try:
+        print(run(ssh, f"sudo -n docker exec {CONTAINER} curl -s -v http://127.0.0.1:{PORT}/health", stream=False))
+    except Exception as e:
+        print("curl failed:", e)
+
+    print("\n### last 200 log lines")
+    print(run(ssh, f"sudo -n docker logs --tail 200 {CONTAINER} || true"))
+
+    print("\n### check model dir exists in the container")
+    print(run(ssh, f"sudo -n docker exec {CONTAINER} bash -lc 'ls -lah /workspace/model || true'"))
+
+if __name__ == "__main__":
+    ssh = open_ssh()
+    print(run(ssh, "uname -a"))
+    ensure_docker_with_nvidia(ssh)
+    ssh = ensure_nvidia_driver(ssh)
+    ensure_docker_with_nvidia(ssh)
+    upload_ctx(ssh)
+    build_and_run(ssh)
+    debug_health(ssh)
+    ssh.close()
+    print(f"\nServer is ✅ Ready! → http://{HOST}:{PORT}\n")
