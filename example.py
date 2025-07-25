@@ -1,7 +1,7 @@
 import requests, pprint
 
-URL = "http://51.79.31.174:8000"
+URL = "http://51.79.26.54:8000"
 print(requests.get(f"{URL}/health").json())
 
-r = requests.post(f"{URL}/generate", json={"prompt": "Are you a woman?", "max_tokens": 128})
+r = requests.post(f"{URL}/generate", json={"prompt": "How are you?", "max_tokens": 128})
 pprint.pp(r.json())
