@@ -95,11 +95,13 @@ def safe_put_file(ssh, local: pathlib.Path, remote: str, show_progress: bool, to
                     if not chunk: break
                     rf.write(chunk); sent += len(chunk)
                     if bump: bump(len(chunk))
+                    # genEntry
                     if show_progress:
                         pct = int(sent * 100 / size)
                         bar = "█"*(pct//2) + "─"*(50-pct//2)
                         sys.stdout.write(f"\r→ {local.name} [{bar}] {pct:3d}% ({fmt_bytes(sent)}/{fmt_bytes(size)})")
                         sys.stdout.flush()
+                    # genFin
             break
         except Exception as e:
             sftp.close()
@@ -113,6 +115,7 @@ def ensure_remote_dir_writable(ssh, path):
     run(ssh, f"mkdir -p {path}", sudo=True, stream=True)
     run(ssh, f"chown -R {USER}:{USER} {path}", sudo=True, stream=True)
 
+# genEntry
 def upload_ctx(ssh):
     print(">> Uploading context…")
     ensure_remote_dir_writable(ssh, REMOTE)
@@ -151,6 +154,7 @@ def upload_ctx(ssh):
             def cb(tx, _): nonlocal last; d=tx-last; last=tx; bump(d) if SHOW_MODE=="sum" or sz==largest else None
             sftp.put(str(p), rpath, callback=cb, confirm=False)
     sftp.close()
+# genFin
 
 
 def ensure_docker_with_nvidia(ssh):
@@ -237,8 +241,10 @@ def configure_noninteractive(ssh):
     run(ssh, "echo 'NEEDRESTART_MODE=a' | sudo tee -a /etc/needrestart/needrestart.conf", sudo=True, stream=True)
     run(ssh, "echo 'DPkg::options { \"--force-confdef\"; };' | sudo tee /etc/apt/apt.conf.d/50forceconfdef", sudo=True, stream=True)
 
+# genEntry
 def gpu_sanity_check(ssh):
     run(ssh, "docker run --rm --gpus all nvidia/cuda:12.6.2-runtime-ubuntu22.04 nvidia-smi", sudo=True, stream=True)
+# genFin
 
 def open_port(ssh, PORT):
     run(ssh, f"ufw allow {PORT}/tcp || true", sudo=True, stream=True)
@@ -321,4 +327,4 @@ if __name__ == "__main__":
     gpu_sanity_check(ssh)
     debug_health(ssh)
     ssh.close()
-    print(f"\nServer is ✅ Ready! → http://{HOST}:{PORT}\n")
+    print(f"\nServer is ✅ Ready! → http://{HOST}:{PORT}\n") # gptGen

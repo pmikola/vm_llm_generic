@@ -11,7 +11,6 @@ from transformers import (
 app = FastAPI()
 
 MODEL_DIR = os.getenv("MODEL_DIR", "/workspace/model")
-
 tokenizer = None
 model = None
 device = "cuda" if torch.cuda.is_available() else "cpu"
