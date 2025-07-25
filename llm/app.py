@@ -20,8 +20,8 @@ last_error: str | None = None
 
 class GenRequest(BaseModel):
     prompt: str
-    max_tokens: int = Field(128, ge=1, le=4096)
-    temperature: float = Field(0.7, ge=0.0)
+    max_tokens: int = Field(300, ge=1, le=4096)
+    temperature: float = Field(0.2, ge=0.0)
     top_p: float = Field(0.9, ge=0.0, le=1.0)
     repetition_penalty: float = Field(1.0, ge=0.8, le=2.0)
 
@@ -91,7 +91,6 @@ def health():
         "device": device,
         "last_error": last_error,
     }
-
 
 @app.post("/generate")
 @torch.inference_mode()
