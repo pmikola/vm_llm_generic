@@ -1,28 +1,15 @@
 #!/usr/bin/env python3
 """deploy.py — push local llm/ context to an OVH VM, build & run the GPU container."""
-
+import asyncio
 import os, sys, time, contextlib, pathlib, socket, posixpath
 import paramiko
 from dotenv import load_dotenv
 from math import log2
+from https_link import upload_model
+from config import *
+from upload_model_srv.deploy_upload_srv import send_model
 
 load_dotenv()
-
-# ───────── config ────────────────────────────────────────────────────────────
-HOST                = os.getenv("OVH_HOST", "51.79.26.54")
-USER                = os.getenv("OVH_USER", "ubuntu")
-KEY                 = os.getenv("OVH_KEY",  r"C:\Users\Msi\.ssh\ssh_test_rsa")
-LOCAL_CTX           = pathlib.Path("llm")
-REMOTE              = f"/home/{USER}/llm"
-HOST_MODEL_DIR      = f"{REMOTE}/model"
-CONTAINER_MODEL_DIR = "/workspace/model"
-IMAGE_TAG           = "llm:latest"
-CONTAINER           = "llm"
-PORT                = 8000
-RETRIES_PER_FILE    = 5
-CHUNK_SIZE          = 4 * 1024 * 1024
-SHOW_MODE           = "sum"   # or "max"
-# ──────────────────────────────────────────────────────────────────────────────
 
 def open_ssh() -> paramiko.SSHClient:
     ssh = paramiko.SSHClient()
@@ -120,6 +107,8 @@ def upload_ctx(ssh):
     print(">> Uploading context…")
     ensure_remote_dir_writable(ssh, REMOTE)
     ensure_remote_dir_writable(ssh, f"{REMOTE}/model")
+    send_model()
+
     sftp = ssh.open_sftp()
     with contextlib.suppress(OSError):
         sftp.mkdir(REMOTE)
