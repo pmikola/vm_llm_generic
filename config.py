@@ -2,7 +2,7 @@
 import os
 import pathlib
 
-HOST                = os.getenv("OVH_HOST", "51.79.26.54")
+HOST                = os.getenv("OVH_HOST", "51.79.100.117")
 USER                = os.getenv("OVH_USER", "ubuntu")
 KEY                 = os.getenv("OVH_KEY",  r"C:\Users\Msi\.ssh\ssh_test_rsa")
 LOCAL_CTX           = pathlib.Path("llm")
