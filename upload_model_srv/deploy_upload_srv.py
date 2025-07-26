@@ -20,7 +20,7 @@ def run_local(cmd: str):
         print(f"Stdout: {result.stdout}")
         print(f"Stderr: {result.stderr}")
         raise subprocess.CalledProcessError(result.returncode, cmd, output=result.stdout, stderr=result.stderr)
-    return result.stdout.strip() # This will now be safe to call
+    return result.stdout.strip()
 
 def get_local_file_hash(file_path):
     if not file_path.exists():
@@ -84,7 +84,16 @@ def send_model():
 
     print("Initiating model upload via HTTP chunks...")
     try:
-        upload_model()
+        target_dir = PROJECT_ROOT / MODEL_DIR
+        files = [p for p in target_dir.rglob("*")
+                 if p.is_file() and "model" in p.name and p.stat().st_size > 100 * 1024 * 1024]
+        if not files:
+            print("No matching files found.")
+            return
+        print("Found", len(files), "large model files; uploading …")
+        for path in files:
+            print("Uploading", path.name, "(", round(path.stat().st_size / 1e9, 2), "GB )")
+            upload_model(path)
         print("✅ Model uploaded successfully via HTTP chunks.")
     except Exception as e:
         print(f"Error during HTTP model upload: {e}")

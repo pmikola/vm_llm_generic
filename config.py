@@ -2,7 +2,8 @@
 import os
 import pathlib
 
-HOST                = os.getenv("OVH_HOST", "51.79.100.117")
+MODEL_HF            = "Qwen/Qwen2.5-72B-Instruct"
+HOST                = os.getenv("OVH_HOST", "148.113.138.38")
 USER                = os.getenv("OVH_USER", "ubuntu")
 KEY                 = os.getenv("OVH_KEY",  r"C:\Users\Msi\.ssh\ssh_test_rsa")
 LOCAL_CTX           = pathlib.Path("llm")
@@ -17,7 +18,7 @@ RETRIES_PER_FILE    = 5
 CHUNK_SIZE          = 4 * 1024 * 1024
 SHOW_MODE           = "sum"   # or "max"
 MODEL_NAME          = "model.safetensors"
-MODEL_DIR           = "llm/model/model.safetensors"
+MODEL_DIR           = "llm/model"
 MODEL_URL           = URL = f"http://{HOST}:{PORT2UPLOAD}/upload?path={CONTAINER_MODEL_DIR}/{MODEL_NAME}"
 CHUNK               = 4 * 1024 * 1024
 MAX_THREADS         = 20

@@ -24,7 +24,6 @@ async def upload_chunk(
         mode = "r+b" if cr else "wb"
         with open(full_path, mode) as f:
             if cr:
-                # parse "bytes X-Y/TOTAL"
                 start = int(cr.split(" ")[1].split("/")[0].split("-")[0])
                 f.seek(start)
             f.write(body)
