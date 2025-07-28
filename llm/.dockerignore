@@ -1,0 +1,6 @@
+model/
+*.safetensors
+*.bin
+*.pt
+.git/
+__pycache__/

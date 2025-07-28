@@ -3,7 +3,7 @@ import os
 import pathlib
 
 MODEL_HF            = "Qwen/Qwen2.5-72B-Instruct"
-HOST                = os.getenv("OVH_HOST", "148.113.138.38")
+HOST                = os.getenv("OVH_HOST", "54.38.138.9")
 USER                = os.getenv("OVH_USER", "ubuntu")
 KEY                 = os.getenv("OVH_KEY",  r"C:\Users\Msi\.ssh\ssh_test_rsa")
 LOCAL_CTX           = pathlib.Path("llm")
