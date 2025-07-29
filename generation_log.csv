@@ -1,0 +1,9 @@
+phase,snippet,tok_per_s
+thought_d0,Human: What is the difference between a virus and a bacteria? Can you expla…,2.153338874105374
+thought_d0,Human: Human: Human: What is the difference between a virus and a bacteria?…,3.0597216694931495
+thought_d1,"Assistant: 1. **Start with the physical evidence**: We can touch, see, and …",3.064668187448842
+thought_d1,"Assistant: 1. **Start with the physical evidence**: We can touch, see, and …",3.0667668856402783
+A0@0.05,Human: What is the difference between a virus and a bacteria? Can you expla…,3.1249512696878705
+A1@0.12,Human: What is the difference between a virus and a bacteria? Can you expla…,3.1157965463236295
+A2@0.19,Human: What is the difference between a virus and a bacteria? Can you expla…,3.1645197168896932
+A3@0.25,Human: What is the difference between a virus and a bacteria? Can you expla…,3.1871011953244404
